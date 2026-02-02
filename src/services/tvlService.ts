@@ -53,6 +53,7 @@ const SNAPSHOT_BLOCK_INTERVAL = 10_000;
 const BRIDGE_SUBGRAPH_URL = env.BRIDGE_SUBGRAPH_URL;
 const SUBGRAPH_LAG_BLOCKS = env.SUBGRAPH_LAG_BLOCKS;
 const SUBGRAPH_PAGE_SIZE = 1_000;
+const SUBGRAPH_SCHEMA_TTL_MS = 5 * 60 * 1000;
 
 interface BridgeVaultBalance {
 	name: string;
@@ -209,6 +210,16 @@ type SubgraphBridgeEvent = {
 	timestamp: number;
 };
 
+type SubgraphCollections = {
+	deposits: string;
+	failed: string | null;
+	withdrawals: string;
+};
+
+let subgraphCollectionsCache:
+	| { data: SubgraphCollections; fetchedAt: number }
+	| null = null;
+
 const parseSubgraphNumber = (value: unknown): number => {
 	if (typeof value === "number" && Number.isFinite(value)) {
 		return value;
@@ -226,6 +237,68 @@ const selectSubgraphTimestamp = (row: Record<string, unknown>): number => {
 		return param;
 	}
 	return parseSubgraphNumber(row.timestamp_);
+};
+
+const resolveSubgraphCollections = async (): Promise<SubgraphCollections> => {
+	const fallback: SubgraphCollections = {
+		deposits: "deposits",
+		failed: "depositTransferFaileds",
+		withdrawals: "withdrawals",
+	};
+	if (!BRIDGE_SUBGRAPH_URL) {
+		return fallback;
+	}
+	const now = Date.now();
+	if (
+		subgraphCollectionsCache &&
+		now - subgraphCollectionsCache.fetchedAt < SUBGRAPH_SCHEMA_TTL_MS
+	) {
+		return subgraphCollectionsCache.data;
+	}
+	try {
+		const response = await fetch(BRIDGE_SUBGRAPH_URL, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				query: "{ __type(name: \"Query\") { fields { name } } }",
+			}),
+		});
+		if (!response.ok) {
+			throw new Error(
+				`Subgraph schema request failed: ${response.status} ${response.statusText}`
+			);
+		}
+		const payload = (await response.json()) as {
+			data?: { __type?: { fields?: Array<{ name?: string }> } };
+		};
+		const fields = payload.data?.__type?.fields ?? [];
+		const names = fields
+			.map((field) => field.name)
+			.filter((name): name is string => typeof name === "string");
+		const findField = (patterns: RegExp[]): string | null =>
+			names.find((name) => patterns.some((pattern) => pattern.test(name))) ??
+			null;
+
+		const deposits =
+			findField([/^deposits$/i, /^deposit$/i]) ?? fallback.deposits;
+		const withdrawals =
+			findField([/^withdrawals$/i, /^withdrawal$/i]) ?? fallback.withdrawals;
+		const failed = findField([
+			/deposittransferfaileds?/i,
+			/deposit_transfer_faileds?/i,
+			/^deposittransferfailed$/i,
+		]);
+		const resolved: SubgraphCollections = {
+			deposits,
+			failed,
+			withdrawals,
+		};
+		subgraphCollectionsCache = { data: resolved, fetchedAt: now };
+		return resolved;
+	} catch (error) {
+		console.warn("Failed to resolve subgraph collections", error);
+		return fallback;
+	}
 };
 
 const fetchSubgraphEvents = async (params: {
@@ -312,27 +385,35 @@ const fetchBridgeEventsFromSubgraph = async (
 	if (!BRIDGE_SUBGRAPH_URL || toBlock < fromBlock) {
 		return [];
 	}
-	const [deposits, failed, withdrawals] = await Promise.all([
-		fetchSubgraphEvents({
-			entity: "Deposit",
-			collection: "deposits",
-			fromBlock,
-			toBlock,
-		}),
-		fetchSubgraphEvents({
-			entity: "DepositTransferFailed",
-			collection: "depositTransferFaileds",
-			fromBlock,
-			toBlock,
-		}),
-		fetchSubgraphEvents({
-			entity: "Withdrawal",
-			collection: "withdrawals",
-			fromBlock,
-			toBlock,
-		}),
-	]);
-	return [...deposits, ...failed, ...withdrawals];
+	try {
+		const collections = await resolveSubgraphCollections();
+		const [deposits, failed, withdrawals] = await Promise.all([
+			fetchSubgraphEvents({
+				entity: "Deposit",
+				collection: collections.deposits,
+				fromBlock,
+				toBlock,
+			}),
+			collections.failed
+				? fetchSubgraphEvents({
+					entity: "DepositTransferFailed",
+					collection: collections.failed,
+					fromBlock,
+					toBlock,
+				})
+				: Promise.resolve([] as SubgraphBridgeEvent[]),
+			fetchSubgraphEvents({
+				entity: "Withdrawal",
+				collection: collections.withdrawals,
+				fromBlock,
+				toBlock,
+			}),
+		]);
+		return [...deposits, ...failed, ...withdrawals];
+	} catch (error) {
+		console.warn("Subgraph bridge query failed", error);
+		return [];
+	}
 };
 
 const getLogsWithRetry = async (params: {
