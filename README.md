@@ -30,6 +30,8 @@ npm start
 See .env.example for the full list. Key variables:
 
 - RPC_URL: Citrea RPC endpoint
+- BRIDGE_SUBGRAPH_URL: Goldsky subgraph GraphQL endpoint for bridge events
+- SUBGRAPH_LAG_BLOCKS: Blocks to treat as “live” (excluded from subgraph due to lag)
 - EXPLORER_API_BASE: Explorer API base URL
 - ALLOWED_ORIGINS: Comma-separated allowlist for CORS
 - RATE_LIMIT_WINDOW_MS / RATE_LIMIT_MAX: API rate limiting
