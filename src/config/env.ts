@@ -28,6 +28,8 @@ const envSchema = z.object({
 		.optional()
 		.default("public, max-age=30, stale-while-revalidate=120"),
 	SENTRY_DSN: z.string().optional().default(""),
+	BRIDGE_SUBGRAPH_URL: z.string().optional().default(""),
+	SUBGRAPH_LAG_BLOCKS: numberFromEnv(10),
 	BRIDGE_TS_REFRESH_MS: numberFromEnv(10 * 60 * 1000),
 	GAS_TS_REFRESH_MS: numberFromEnv(10 * 60 * 1000),
 	SERIES_WINDOW_DAYS: numberFromEnv(7),
@@ -55,6 +57,8 @@ export const env = envSchema.parse({
 	RATE_LIMIT_MAX: process.env.RATE_LIMIT_MAX,
 	CACHE_CONTROL: process.env.CACHE_CONTROL,
 	SENTRY_DSN: process.env.SENTRY_DSN,
+	BRIDGE_SUBGRAPH_URL: process.env.BRIDGE_SUBGRAPH_URL,
+	SUBGRAPH_LAG_BLOCKS: process.env.SUBGRAPH_LAG_BLOCKS,
 	BRIDGE_TS_REFRESH_MS: process.env.BRIDGE_TS_REFRESH_MS,
 	GAS_TS_REFRESH_MS: process.env.GAS_TS_REFRESH_MS,
 	SERIES_WINDOW_DAYS: process.env.SERIES_WINDOW_DAYS,

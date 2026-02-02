@@ -50,6 +50,9 @@ const MAX_LOG_CHUNK_SIZE = 1_000;
 const HISTORY_DB_FILE = resolve(process.cwd(), "data", "history.db");
 const HISTORY_SCHEMA_VERSION = 1;
 const SNAPSHOT_BLOCK_INTERVAL = 10_000;
+const BRIDGE_SUBGRAPH_URL = env.BRIDGE_SUBGRAPH_URL;
+const SUBGRAPH_LAG_BLOCKS = env.SUBGRAPH_LAG_BLOCKS;
+const SUBGRAPH_PAGE_SIZE = 1_000;
 
 interface BridgeVaultBalance {
 	name: string;
@@ -197,6 +200,139 @@ const sleep = (ms: number) =>
 const isRateLimitError = (error: unknown) => {
 	const message = error instanceof Error ? error.message : String(error);
 	return /rate limit|too many requests|429|timeout/i.test(message);
+};
+
+type SubgraphBridgeEvent = {
+	id: string;
+	type: "deposit" | "failed" | "withdrawal";
+	blockNumber: number;
+	timestamp: number;
+};
+
+const parseSubgraphNumber = (value: unknown): number => {
+	if (typeof value === "number" && Number.isFinite(value)) {
+		return value;
+	}
+	if (typeof value === "string" && value.trim() !== "") {
+		const parsed = Number(value);
+		return Number.isFinite(parsed) ? parsed : 0;
+	}
+	return 0;
+};
+
+const selectSubgraphTimestamp = (row: Record<string, unknown>): number => {
+	const param = parseSubgraphNumber(row.timestampParam);
+	if (param > 0) {
+		return param;
+	}
+	return parseSubgraphNumber(row.timestamp_);
+};
+
+const fetchSubgraphEvents = async (params: {
+	entity: "Deposit" | "DepositTransferFailed" | "Withdrawal";
+	collection: string;
+	fromBlock: number;
+	toBlock: number;
+}): Promise<SubgraphBridgeEvent[]> => {
+	if (!BRIDGE_SUBGRAPH_URL) {
+		return [];
+	}
+
+	const events: SubgraphBridgeEvent[] = [];
+	let cursor = "";
+	while (true) {
+		const query = `query($first: Int!, $from: BigInt!, $to: BigInt!, $idGt: ID!) {
+			${params.collection}(first: $first, orderBy: id, orderDirection: asc, where: { block_number_gte: $from, block_number_lte: $to, id_gt: $idGt }) {
+				id
+				block_number
+				timestamp_
+				timestampParam
+			}
+		}`;
+		const response = await fetch(BRIDGE_SUBGRAPH_URL, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				query,
+				variables: {
+					first: SUBGRAPH_PAGE_SIZE,
+					from: params.fromBlock,
+					to: params.toBlock,
+					idGt: cursor,
+				},
+			}),
+		});
+		if (!response.ok) {
+			throw new Error(
+				`Subgraph request failed: ${response.status} ${response.statusText}`
+			);
+		}
+		const payload = (await response.json()) as {
+			data?: Record<string, Array<Record<string, unknown>>>;
+			errors?: Array<{ message?: string }>;
+		};
+		if (payload.errors && payload.errors.length > 0) {
+			throw new Error(payload.errors.map((err) => err.message).join("; "));
+		}
+		const rows = payload.data?.[params.collection] ?? [];
+		if (!Array.isArray(rows) || rows.length === 0) {
+			break;
+		}
+		for (const row of rows) {
+			const blockNumber = parseSubgraphNumber(row.block_number);
+			const timestamp = selectSubgraphTimestamp(row);
+			events.push({
+				id: String(row.id ?? ""),
+				type:
+					params.entity === "Deposit"
+						? "deposit"
+						: params.entity === "DepositTransferFailed"
+							? "failed"
+							: "withdrawal",
+				blockNumber,
+				timestamp,
+			});
+		}
+		if (rows.length < SUBGRAPH_PAGE_SIZE) {
+			break;
+		}
+		cursor = String(rows[rows.length - 1]?.id ?? "");
+		if (!cursor) {
+			break;
+		}
+	}
+
+	return events;
+};
+
+const fetchBridgeEventsFromSubgraph = async (
+	fromBlock: number,
+	toBlock: number
+): Promise<SubgraphBridgeEvent[]> => {
+	if (!BRIDGE_SUBGRAPH_URL || toBlock < fromBlock) {
+		return [];
+	}
+	const [deposits, failed, withdrawals] = await Promise.all([
+		fetchSubgraphEvents({
+			entity: "Deposit",
+			collection: "deposits",
+			fromBlock,
+			toBlock,
+		}),
+		fetchSubgraphEvents({
+			entity: "DepositTransferFailed",
+			collection: "depositTransferFaileds",
+			fromBlock,
+			toBlock,
+		}),
+		fetchSubgraphEvents({
+			entity: "Withdrawal",
+			collection: "withdrawals",
+			fromBlock,
+			toBlock,
+		}),
+	]);
+	return [...deposits, ...failed, ...withdrawals];
 };
 
 const getLogsWithRetry = async (params: {
@@ -433,6 +569,46 @@ const refreshCbtcSupplyState = async (): Promise<void> => {
 		let totalFailedCount = state.failedDepositCount ?? 0;
 		let totalWithdrawalCount = state.withdrawalCount ?? 0;
 		let chunkCounter = 0;
+
+		const subgraphCutoff = BRIDGE_SUBGRAPH_URL
+			? Math.max(BRIDGE_LAUNCH_BLOCK, targetBlock - SUBGRAPH_LAG_BLOCKS)
+			: -1;
+		if (subgraphCutoff >= state.lastScannedBlock + 1) {
+			const subgraphFrom = state.lastScannedBlock + 1;
+			const subgraphEvents = await fetchBridgeEventsFromSubgraph(
+				subgraphFrom,
+				subgraphCutoff
+			);
+			let depositCount = 0;
+			let failedDepositCount = 0;
+			let withdrawalCount = 0;
+			for (const event of subgraphEvents) {
+				if (event.type === "deposit") {
+					depositCount += 1;
+				} else if (event.type === "failed") {
+					failedDepositCount += 1;
+				} else if (event.type === "withdrawal") {
+					withdrawalCount += 1;
+				}
+			}
+			const deltaCount = depositCount + failedDepositCount - withdrawalCount;
+			const deltaWei = BigInt(deltaCount) * depositAmount;
+			currentWei = currentWei + deltaWei;
+			totalDepositCount += depositCount;
+			totalFailedCount += failedDepositCount;
+			totalWithdrawalCount += withdrawalCount;
+			state.lastScannedBlock = subgraphCutoff;
+			state.cbtcSupplyWei = (currentWei > 0n ? currentWei : 0n).toString();
+			state.depositCount = totalDepositCount;
+			state.failedDepositCount = totalFailedCount;
+			state.withdrawalCount = totalWithdrawalCount;
+			state.lastUpdated = Date.now();
+			supplyState = state;
+			await persistSupplyState(state);
+			if (catchUpMode) {
+				await recordSnapshot(subgraphCutoff);
+			}
+		}
 
 		for (
 			let batchStart = state.lastScannedBlock + 1;
@@ -796,56 +972,84 @@ async function refreshBridgeTimeseries(forceFull = false): Promise<void> {
 				)
 			: Math.min(latestBlock, bridgeTsState!.lastScannedBlock + 1);
 
-		const step = Math.min(BRIDGE_LOG_CHUNK_SIZE, MAX_LOG_CHUNK_SIZE);
-		for (
-			let batchStart = fromBlock;
-			batchStart <= latestBlock;
-			batchStart += step * CONCURRENCY_LIMIT
-		) {
-			const ranges: Array<{ start: number; end: number }> = [];
-			for (
-				let start = batchStart;
-				start <= latestBlock && ranges.length < CONCURRENCY_LIMIT;
-				start += step
-			) {
-				const end = Math.min(start + step - 1, latestBlock);
-				ranges.push({ start, end });
-			}
-
-			const batchLogs = await Promise.all(
-				ranges.map((range) =>
-					getLogsWithRetry({
-						address: BRIDGE_ADDRESS,
-						fromBlock: range.start,
-						toBlock: range.end,
-						topics: [[depositTopic, failedDepositTopic, withdrawalTopic]],
-					})
-				)
+		const subgraphCutoff = BRIDGE_SUBGRAPH_URL
+			? Math.max(0, latestBlock - SUBGRAPH_LAG_BLOCKS)
+			: -1;
+		if (subgraphCutoff >= fromBlock) {
+			const subgraphEvents = await fetchBridgeEventsFromSubgraph(
+				fromBlock,
+				subgraphCutoff
 			);
+			for (const event of subgraphEvents) {
+				const timestamp = event.timestamp;
+				if (!timestamp) {
+					continue;
+				}
+				const dayKey = formatDayKey(timestamp);
+				if (!bucket[dayKey]) {
+					bucket[dayKey] = { inflow: 0, outflow: 0 };
+				}
+				if (event.type === "withdrawal") {
+					bucket[dayKey].outflow += depositAmountCbtc;
+				} else {
+					bucket[dayKey].inflow += depositAmountCbtc;
+				}
+			}
+		}
 
-			for (const logs of batchLogs) {
-				for (const log of logs) {
-					const topic = log.topics[0];
-					if (!topic) {
-						continue;
-					}
-					const logType = topicMap[topic];
-					if (!logType) {
-						continue;
-					}
-					const parsed = iface.parseLog(log);
-					if (!parsed) {
-						continue;
-					}
-					const timestamp = Number(parsed.args.timestamp);
-					const dayKey = formatDayKey(timestamp);
-					if (!bucket[dayKey]) {
-						bucket[dayKey] = { inflow: 0, outflow: 0 };
-					}
-					if (logType === "withdrawal") {
-						bucket[dayKey].outflow += depositAmountCbtc;
-					} else {
-						bucket[dayKey].inflow += depositAmountCbtc;
+		const rpcFromBlock = Math.max(fromBlock, subgraphCutoff + 1);
+		if (rpcFromBlock <= latestBlock) {
+			const step = Math.min(BRIDGE_LOG_CHUNK_SIZE, MAX_LOG_CHUNK_SIZE);
+			for (
+				let batchStart = rpcFromBlock;
+				batchStart <= latestBlock;
+				batchStart += step * CONCURRENCY_LIMIT
+			) {
+				const ranges: Array<{ start: number; end: number }> = [];
+				for (
+					let start = batchStart;
+					start <= latestBlock && ranges.length < CONCURRENCY_LIMIT;
+					start += step
+				) {
+					const end = Math.min(start + step - 1, latestBlock);
+					ranges.push({ start, end });
+				}
+
+				const batchLogs = await Promise.all(
+					ranges.map((range) =>
+						getLogsWithRetry({
+							address: BRIDGE_ADDRESS,
+							fromBlock: range.start,
+							toBlock: range.end,
+							topics: [[depositTopic, failedDepositTopic, withdrawalTopic]],
+						})
+					)
+				);
+
+				for (const logs of batchLogs) {
+					for (const log of logs) {
+						const topic = log.topics[0];
+						if (!topic) {
+							continue;
+						}
+						const logType = topicMap[topic];
+						if (!logType) {
+							continue;
+						}
+						const parsed = iface.parseLog(log);
+						if (!parsed) {
+							continue;
+						}
+						const timestamp = Number(parsed.args.timestamp);
+						const dayKey = formatDayKey(timestamp);
+						if (!bucket[dayKey]) {
+							bucket[dayKey] = { inflow: 0, outflow: 0 };
+						}
+						if (logType === "withdrawal") {
+							bucket[dayKey].outflow += depositAmountCbtc;
+						} else {
+							bucket[dayKey].inflow += depositAmountCbtc;
+						}
 					}
 				}
 			}
