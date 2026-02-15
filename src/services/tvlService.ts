@@ -1513,6 +1513,7 @@ export async function calculateGlobalTvl(): Promise<GlobalTvlResult> {
 				primaryPricingStrategy: token.primaryPricingStrategy,
 				...(token.coingeckoId ? { coingeckoId: token.coingeckoId } : {}),
 				...(token.peggedTo ? { peggedTo: token.peggedTo } : {}),
+				...(token.oracleConfig ? { oracleConfig: token.oracleConfig } : {}),
 				...(dexConfig ? { dexConfig } : {}),
 			});
 

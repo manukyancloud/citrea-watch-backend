@@ -4,8 +4,12 @@ export interface TrackedToken {
   decimals: number;
   type: 'ERC20' | 'ERC721' | 'ERC1155' | 'NATIVE';
   coingeckoId?: string;
-  primaryPricingStrategy: 'coingecko' | 'dex' | 'pegged' | 'none';
+  primaryPricingStrategy: 'coingecko' | 'dex' | 'pegged' | 'oracle' | 'none';
   peggedTo?: string;
+  oracleConfig?: {
+    oracleAddress: string;
+    priceDecimals?: number;
+  };
   dexConfig?: {
     poolAddress: string;
     baseTokenSymbol: string;
@@ -30,10 +34,10 @@ export const TRACKED_TOKENS: TrackedToken[] = [
     address: '0x8D82c4E3c936C7B5724A382a9c5a4E6Eb7aB6d5D',
     decimals: 6,
     type: 'ERC20',
-    primaryPricingStrategy: 'dex',
-    dexConfig: {
-        poolAddress: '0x172d2ab563afdaace7247a6592ee1be62e791165',
-        baseTokenSymbol: 'USDC.e'
+    primaryPricingStrategy: 'oracle',
+    oracleConfig: {
+      oracleAddress: '0xd8A09eEf673e877C0eD4ac5caEa6f935D5158144',
+      priceDecimals: 8
     }
   },
   {
@@ -41,8 +45,11 @@ export const TRACKED_TOKENS: TrackedToken[] = [
     address: '0xE045e6c36cF77FAA2CfB54466D71A3aEF7bbE839',
     decimals: 6,
     type: 'ERC20',
-    primaryPricingStrategy: 'pegged', // 1.0
-    peggedTo: 'usd-coin'
+    primaryPricingStrategy: 'oracle',
+    oracleConfig: {
+      oracleAddress: '0xd8A09eEf673e877C0eD4ac5caEa6f935D5158144',
+      priceDecimals: 8
+    }
   },
   {
     symbol: 'USDT.e',
@@ -78,8 +85,11 @@ export const TRACKED_TOKENS: TrackedToken[] = [
     address: '0x3100000000000000000000000000000000000006',
     decimals: 18,
     type: 'ERC20',
-    primaryPricingStrategy: 'pegged',
-    peggedTo: 'bitcoin'
+    primaryPricingStrategy: 'oracle',
+    oracleConfig: {
+      oracleAddress: '0xd8A09eEf673e877C0eD4ac5caEa6f935D5158144',
+      priceDecimals: 8
+    }
   },
   {
     symbol: 'syBTC',

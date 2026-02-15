@@ -350,9 +350,13 @@ export async function fetchPriceFromAlgebraPool(
 export async function getTokenPriceUsd(params: {
 	tokenAddress: string;
 	symbol: string;
-	primaryPricingStrategy: "coingecko" | "dex" | "pegged" | "none";
+	primaryPricingStrategy: "coingecko" | "dex" | "pegged" | "oracle" | "none";
 	coingeckoId?: string;
 	peggedTo?: string;
+	oracleConfig?: {
+		oracleAddress: string;
+		priceDecimals?: number;
+	};
 	dexConfig?: {
 		poolAddress: string;
 		baseTokenSymbol: string;
@@ -393,6 +397,37 @@ export async function getTokenPriceUsd(params: {
 			priceSource = params.peggedTo ? `pegged:${params.peggedTo}` : "pegged";
 			break;
 		}
+		case "oracle": {
+			if (!params.oracleConfig?.oracleAddress) {
+				throw new Error("Missing oracleConfig.oracleAddress for oracle pricing");
+			}
+			const ORACLE_ABI = [
+				"function getAssetPrice(address asset) view returns (uint256)",
+				"function decimals() view returns (uint8)",
+			];
+			const oracle = new Contract(
+				params.oracleConfig.oracleAddress,
+				ORACLE_ABI,
+				provider
+			) as unknown as {
+				getAssetPrice: (asset: string) => Promise<bigint>;
+				decimals: () => Promise<number>;
+			};
+
+			const rawPrice = await oracle.getAssetPrice(params.tokenAddress);
+			let priceDecimals = params.oracleConfig.priceDecimals ?? null;
+			if (priceDecimals === null) {
+				try {
+					priceDecimals = await oracle.decimals();
+				} catch {
+					priceDecimals = 8;
+				}
+			}
+			const divisor = 10 ** priceDecimals;
+			priceUsd = Number(rawPrice) / divisor;
+			priceSource = "oracle";
+			break;
+		}
 		case "dex": {
 			try {
 				if (!params.dexConfig?.poolAddress) {
@@ -422,6 +457,9 @@ export async function getTokenPriceUsd(params: {
 						? { coingeckoId: baseToken.coingeckoId }
 						: {}),
 					...(baseToken.peggedTo ? { peggedTo: baseToken.peggedTo } : {}),
+					...(baseToken.oracleConfig
+						? { oracleConfig: baseToken.oracleConfig }
+						: {}),
 					...(baseToken.dexConfig ? { dexConfig: baseToken.dexConfig } : {}),
 				});
 
