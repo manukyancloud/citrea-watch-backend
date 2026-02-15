@@ -163,35 +163,7 @@ let globalTvlInFlight = false;
 let historyDb: Database.Database | null = null;
 let historyBackfillInFlight = false;
 
-async function countBridgeLogs(topic: string): Promise<number> {
-	const latestBlock = await provider.getBlockNumber();
-	const step = 1_000;
-	let count = 0;
-	let scanned = 0;
-	const totalRanges = Math.ceil((latestBlock + 1) / step);
-	const logEvery = 100; // ~100k blocks per log
 
-	for (let fromBlock = 0; fromBlock <= latestBlock; fromBlock += step) {
-		const toBlock = Math.min(fromBlock + step - 1, latestBlock);
-		const logs = await getLogsWithRetry({
-			address: BRIDGE_ADDRESS,
-			fromBlock,
-			toBlock,
-			topics: [topic],
-		});
-		count += logs.length;
-		scanned += 1;
-		if (scanned % logEvery === 0 || toBlock === latestBlock) {
-			console.log("[cBTC] scan progress", {
-				ranges: `${scanned}/${totalRanges}`,
-				toBlock,
-				count,
-			});
-		}
-	}
-
-	return count;
-}
 
 const sleep = (ms: number) =>
 	new Promise((resolve) => {
@@ -450,6 +422,9 @@ const getHistoryDb = (): Database.Database => {
 	db.pragma("journal_mode = WAL");
 	db.exec(
 		"CREATE TABLE IF NOT EXISTS tvl_snapshots (timestamp INTEGER NOT NULL, blockNumber INTEGER NOT NULL, totalTvlUsd REAL NOT NULL, cbtcSupply REAL NOT NULL, ctUsdSupply REAL NOT NULL, syBtcSupply REAL NOT NULL, PRIMARY KEY (blockNumber));"
+	);
+	db.exec(
+		"CREATE INDEX IF NOT EXISTS idx_tvl_snapshots_timestamp ON tvl_snapshots (timestamp);"
 	);
 	db.exec(
 		"CREATE TABLE IF NOT EXISTS tvl_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
@@ -766,7 +741,13 @@ const refreshCbtcSupplyState = async (): Promise<void> => {
 	}
 };
 
+const BLOCK_TIME_CACHE_TTL_MS = 5 * 60 * 1000;
+let blockTimeCache: { value: number; fetchedAt: number } | null = null;
+
 async function estimateBlockTimeSeconds(sampleSize = 500): Promise<number> {
+	if (blockTimeCache && Date.now() - blockTimeCache.fetchedAt < BLOCK_TIME_CACHE_TTL_MS) {
+		return blockTimeCache.value;
+	}
 	const latestBlock = await provider.getBlockNumber();
 	const safeSample = Math.min(sampleSize, latestBlock);
 	if (safeSample <= 0) {
@@ -780,7 +761,9 @@ async function estimateBlockTimeSeconds(sampleSize = 500): Promise<number> {
 		return 2;
 	}
 	const delta = Number(latest.timestamp - older.timestamp);
-	return delta > 0 ? delta / safeSample : 2;
+	const result = delta > 0 ? delta / safeSample : 2;
+	blockTimeCache = { value: result, fetchedAt: Date.now() };
+	return result;
 }
 
 const backfillTvlHistoryIfNeeded = async (): Promise<void> => {
@@ -860,7 +843,13 @@ const buildEmptyGasPoints = (nowSec: number): GasTimeseriesPoint[] => {
 const recordTvlPoint = (totalTvlUsd: number, timestampSec: number) => {
 	tvlHistory.push({ timestamp: timestampSec, totalTvlUsd });
 	const cutoff = timestampSec - TVL_HISTORY_DAYS * 24 * 3600;
-	tvlHistory = tvlHistory.filter((point) => point.timestamp >= cutoff);
+	let i = 0;
+	while (i < tvlHistory.length && tvlHistory[i]!.timestamp < cutoff) {
+		i++;
+	}
+	if (i > 0) {
+		tvlHistory.splice(0, i);
+	}
 };
 
 const getTvlChange = (days: number, currentTotal: number, nowSec: number) => {
@@ -1047,10 +1036,10 @@ async function refreshBridgeTimeseries(forceFull = false): Promise<void> {
 			: { ...bridgeTsState!.bucket };
 		const fromBlock = isFull
 			? Math.max(
-					0,
-					latestBlock -
-						Math.ceil((SERIES_WINDOW_DAYS * 24 * 3600) / blockTimeSec)
-				)
+				0,
+				latestBlock -
+				Math.ceil((SERIES_WINDOW_DAYS * 24 * 3600) / blockTimeSec)
+			)
 			: Math.min(latestBlock, bridgeTsState!.lastScannedBlock + 1);
 
 		const subgraphCutoff = BRIDGE_SUBGRAPH_URL
@@ -1205,15 +1194,26 @@ async function refreshGasTimeseries(forceFull = false): Promise<void> {
 			: gasSeriesState!.lastTimestamp;
 		const startHour = needsFull ? lastTimestamp : lastTimestamp + 3600;
 
+		const hourEntries: Array<{ ts: number; blockNumber: number }> = [];
 		for (let ts = startHour; ts <= currentHour; ts += 3600) {
 			const blocksBack = Math.round((latestTimestamp - ts) / blockTimeSec);
 			const blockNumber = Math.max(0, latestBlock - blocksBack);
-			const block = await provider.getBlock(blockNumber);
-			const baseFee = block?.baseFeePerGas ?? 0n;
-			points.push({
-				timestamp: ts,
-				baseFeeGwei: Number(formatUnits(baseFee, "gwei")),
-			});
+			hourEntries.push({ ts, blockNumber });
+		}
+		const GAS_BATCH_SIZE = 10;
+		for (let i = 0; i < hourEntries.length; i += GAS_BATCH_SIZE) {
+			const batch = hourEntries.slice(i, i + GAS_BATCH_SIZE);
+			const blocks = await Promise.all(
+				batch.map((entry) => provider.getBlock(entry.blockNumber))
+			);
+			for (let j = 0; j < batch.length; j++) {
+				const baseFee = blocks[j]?.baseFeePerGas ?? 0n;
+				const entry = batch[j]!;
+				points.push({
+					timestamp: entry.ts,
+					baseFeeGwei: Number(formatUnits(baseFee, "gwei")),
+				});
+			}
 		}
 
 		while (points.length > hoursBack) {
@@ -1487,18 +1487,14 @@ async function fetchTokenSupply(token: TrackedToken): Promise<number> {
 }
 
 export async function calculateGlobalTvl(): Promise<GlobalTvlResult> {
-	const results: TokenTvlResult[] = [];
+	const eligibleTokens = TRACKED_TOKENS.filter(
+		(token) =>
+			(token.type === "ERC20" || token.type === "NATIVE") &&
+			token.address.toLowerCase() !== WCBTC_ADDRESS.toLowerCase()
+	);
 
-	for (const token of TRACKED_TOKENS) {
-		if (token.type !== "ERC20" && token.type !== "NATIVE") {
-			continue;
-		}
-		if (token.address.toLowerCase() === WCBTC_ADDRESS.toLowerCase()) {
-			continue;
-		}
-
-		try {
-			const supply = await fetchTokenSupply(token);
+	const settled = await Promise.allSettled(
+		eligibleTokens.map(async (token) => {
 			const dexConfig = (token as {
 				dexConfig?: { poolAddress: string; baseTokenSymbol: string };
 			}).dexConfig;
@@ -1507,37 +1503,46 @@ export async function calculateGlobalTvl(): Promise<GlobalTvlResult> {
 					? WCBTC_ADDRESS
 					: token.address;
 
-			const price = await getTokenPriceUsd({
-				tokenAddress: pricingAddress,
-				symbol: token.symbol,
-				primaryPricingStrategy: token.primaryPricingStrategy,
-				...(token.coingeckoId ? { coingeckoId: token.coingeckoId } : {}),
-				...(token.peggedTo ? { peggedTo: token.peggedTo } : {}),
-				...(token.oracleConfig ? { oracleConfig: token.oracleConfig } : {}),
-				...(dexConfig ? { dexConfig } : {}),
-			});
+			const [supply, price] = await Promise.all([
+				fetchTokenSupply(token),
+				getTokenPriceUsd({
+					tokenAddress: pricingAddress,
+					symbol: token.symbol,
+					primaryPricingStrategy: token.primaryPricingStrategy,
+					...(token.coingeckoId ? { coingeckoId: token.coingeckoId } : {}),
+					...(token.peggedTo ? { peggedTo: token.peggedTo } : {}),
+					...(token.oracleConfig ? { oracleConfig: token.oracleConfig } : {}),
+					...(dexConfig ? { dexConfig } : {}),
+				}),
+			]);
 
 			const priceUsd = price.priceUsd;
 			const tvlUsd = priceUsd === null ? 0 : supply * priceUsd;
 
-			results.push({
+			return {
 				symbol: token.symbol,
 				supply,
 				priceUsd,
 				tvlUsd,
 				priceSource: price.priceSource,
-			});
-		} catch (error) {
-			console.error(`Failed to process token ${token.symbol}:`, error);
-			results.push({
-				symbol: token.symbol,
-				supply: 0,
-				priceUsd: null,
-				tvlUsd: 0,
-				priceSource: "error",
-			});
+			} as TokenTvlResult;
+		})
+	);
+
+	const results: TokenTvlResult[] = settled.map((result, index) => {
+		if (result.status === "fulfilled") {
+			return result.value;
 		}
-	}
+		const token = eligibleTokens[index]!;
+		console.error(`Failed to process token ${token.symbol}:`, result.reason);
+		return {
+			symbol: token.symbol,
+			supply: 0,
+			priceUsd: null,
+			tvlUsd: 0,
+			priceSource: "error",
+		};
+	});
 
 	const totalTvlUsd = results.reduce((sum, token) => sum + token.tvlUsd, 0);
 

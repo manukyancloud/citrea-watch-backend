@@ -254,11 +254,11 @@ export async function getExplorerSummary(): Promise<ExplorerSummary> {
     return explorerCache.data;
   }
 
-  const [stats, txChart] = await Promise.all([
+  const [stats, txChart, totalTokens] = await Promise.all([
     resolveStats(),
     resolveTransactionsChart(),
+    resolveTokenCount(),
   ]);
-  const totalTokens = await resolveTokenCount();
 
   const statsObj = stats ?? {};
   const statsRoot =
@@ -338,8 +338,8 @@ export async function getExplorerSummary(): Promise<ExplorerSummary> {
   const tps = tpsFromStats ?? tpsFrom24h ?? tpsFromToday ?? null;
   const txFees24hCbtc =
     typeof gasUsedToday === "number" &&
-    gasPrices?.average !== null &&
-    typeof gasPrices?.average === "number"
+      gasPrices?.average !== null &&
+      typeof gasPrices?.average === "number"
       ? (gasUsedToday * gasPrices.average) / 1e9
       : null;
 

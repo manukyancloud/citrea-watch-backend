@@ -40,6 +40,70 @@ function getCacheKey(symbol: string, strategy: string): string {
 	return `${symbol.toLowerCase()}::${strategy}`;
 }
 
+export async function batchFetchCoingeckoPrices(
+	ids: string[]
+): Promise<Map<string, number>> {
+	const result = new Map<string, number>();
+	if (ids.length === 0) {
+		return result;
+	}
+	const now = Date.now();
+	const uncachedIds: string[] = [];
+	for (const id of ids) {
+		const cached = coingeckoIdCache.get(id);
+		if (cached && now - cached.fetchedAt < CACHE_TTL_MS && typeof cached.priceUsd === "number") {
+			result.set(id, cached.priceUsd);
+		} else {
+			uncachedIds.push(id);
+		}
+	}
+	if (uncachedIds.length === 0) {
+		return result;
+	}
+	const url = `${COINGECKO_ENDPOINT}?ids=${uncachedIds
+		.map(encodeURIComponent)
+		.join(",")}&vs_currencies=usd`;
+	try {
+		const response = await fetch(url, {
+			method: "GET",
+			headers: { Accept: "application/json" },
+		});
+		if (response.status === 429) {
+			for (const id of uncachedIds) {
+				const cached = coingeckoIdCache.get(id);
+				if (cached && typeof cached.priceUsd === "number") {
+					result.set(id, cached.priceUsd);
+				}
+			}
+			return result;
+		}
+		if (!response.ok) {
+			throw new Error(`Coingecko batch request failed: ${response.status}`);
+		}
+		const data = (await response.json()) as Record<string, { usd?: number }>;
+		for (const id of uncachedIds) {
+			const price = data?.[id]?.usd;
+			if (typeof price === "number") {
+				result.set(id, price);
+				coingeckoIdCache.set(id, {
+					priceUsd: price,
+					priceSource: "coingecko",
+					fetchedAt: now,
+				});
+			}
+		}
+	} catch (error) {
+		for (const id of uncachedIds) {
+			const cached = coingeckoIdCache.get(id);
+			if (cached && typeof cached.priceUsd === "number") {
+				result.set(id, cached.priceUsd);
+			}
+		}
+		console.warn("Coingecko batch fetch error", error);
+	}
+	return result;
+}
+
 async function fetchCoingeckoPriceUsd(coingeckoId: string): Promise<number> {
 	const cached = coingeckoIdCache.get(coingeckoId);
 	const now = Date.now();
@@ -50,56 +114,16 @@ async function fetchCoingeckoPriceUsd(coingeckoId: string): Promise<number> {
 		}
 	}
 
-	const url = `${COINGECKO_ENDPOINT}?ids=${encodeURIComponent(
-		coingeckoId
-	)}&vs_currencies=usd`;
-
-	try {
-		const response = await fetch(url, {
-			method: "GET",
-			headers: {
-				Accept: "application/json",
-			},
-		});
-
-		if (response.status === 429) {
-			if (cached && typeof cached.priceUsd === "number") {
-				console.warn(
-					`Coingecko rate limited for ${coingeckoId}; using stale cache.`
-				);
-				return cached.priceUsd;
-			}
-			throw new Error("Coingecko rate limited (429)");
-		}
-
-		if (!response.ok) {
-			throw new Error(`Coingecko request failed: ${response.status}`);
-		}
-
-		const data = (await response.json()) as Record<string, { usd?: number }>;
-		const price = data?.[coingeckoId]?.usd;
-
-		if (typeof price !== "number") {
-			throw new Error("Coingecko response missing USD price");
-		}
-
-		coingeckoIdCache.set(coingeckoId, {
-			priceUsd: price,
-			priceSource: "coingecko",
-			fetchedAt: now,
-		});
-
+	const results = await batchFetchCoingeckoPrices([coingeckoId]);
+	const price = results.get(coingeckoId);
+	if (typeof price === "number") {
 		return price;
-	} catch (error) {
-		if (cached && typeof cached.priceUsd === "number") {
-			console.warn(
-				`Coingecko error for ${coingeckoId}; using stale cache.`,
-				error
-			);
-			return cached.priceUsd;
-		}
-		throw error;
 	}
+
+	if (cached && typeof cached.priceUsd === "number") {
+		return cached.priceUsd;
+	}
+	throw new Error(`Coingecko price not available for ${coingeckoId}`);
 }
 
 function resolveCoingeckoIdFromSymbol(symbol?: string): string | null {
